@@ -28,12 +28,17 @@ async fn run_wake_pause(
         spotify.transfer_playback(device_id, Some(false)).await?;
 
         // Give the API a moment to process, then check if the device actually woke up
-        sleep(Duration::from_millis(300)).await;
-        let check = spotify.current_playback(None, None::<Vec<_>>).await?;
-        let device_active = check
-            .as_ref()
-            .and_then(|p| p.device.id.as_deref())
-            == Some(device_id);
+        // We poll a few times because it might take a second to register as active
+        let mut device_active = false;
+        for _ in 0..5 {
+            sleep(Duration::from_millis(300)).await;
+            if let Ok(Some(check)) = spotify.current_playback(None, None::<Vec<_>>).await {
+                if check.device.id.as_deref() == Some(device_id) {
+                    device_active = true;
+                    break;
+                }
+            }
+        }
 
         if device_active {
             println!("Music was paused. Transferred to device (paused state preserved).");
@@ -45,11 +50,21 @@ async fn run_wake_pause(
             // Explicitly target the device_id to avoid 403 errors if the current active device is a phone
             spotify.volume(0, Some(device_id)).await?;
 
+            // 1.5 Wait until the API confirms the volume drop (prevents sound leak race conditions)
+            for _ in 0..10 {
+                sleep(Duration::from_millis(200)).await;
+                if let Ok(devices) = spotify.device().await {
+                    if devices.iter().any(|d| d.id.as_deref() == Some(device_id) && d.volume_percent == Some(0)) {
+                        break;
+                    }
+                }
+            }
+
             // 2. Force the device to wake up by starting playback (at volume 0)
             spotify.transfer_playback(device_id, Some(true)).await?;
 
             // 3. Give Spotify servers a moment to register the device
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(400)).await;
 
             // 4. Pause playback
             spotify.pause_playback(Some(device_id)).await?;
@@ -143,22 +158,39 @@ async fn run_app() -> Result<(), String> {
         Err(e) => return Err(format!("Failed to authenticate. If this is your first time, please run with -debug from the command prompt. Error: {}", e)),
     }
 
-    // Fetch the target device's explicit volume before we start, so we can restore it exactly
+    // Poll the API for the target device to become available.
+    // Spotify can take a while to open, so we wait until it registers.
     let mut target_volume: u8 = 50; // Fallback
-    if let Ok(devices) = spotify.device().await {
-        for d in devices {
-            if d.id.as_deref() == Some(device_id.as_str()) {
-                if let Some(vol) = d.volume_percent {
-                    target_volume = vol as u8;
+    let mut device_ready = false;
+    let max_polls = 120; // Up to 60 seconds (120 * 500ms)
+
+    println!("Polling for device {} to become available...", device_id);
+    for attempt in 1..=max_polls {
+        if let Ok(devices) = spotify.device().await {
+            for d in devices {
+                if d.id.as_deref() == Some(device_id.as_str()) {
+                    if let Some(vol) = d.volume_percent {
+                        target_volume = vol as u8;
+                    }
+                    device_ready = true;
+                    break;
                 }
-                break;
             }
         }
+        if device_ready {
+            println!("Device found after {} poll(s).", attempt);
+            break;
+        }
+        sleep(Duration::from_millis(500)).await;
     }
 
-    // Retry up to 10 times on 404 errors — the Spotify app may have just opened
-    // and the API needs a moment to register the device
-    let max_retries = 10;
+    if !device_ready {
+        println!("Warning: Device not found after polling for {} seconds. Will attempt commands anyway.", max_polls / 2);
+    }
+
+    // Run the wake/pause logic
+    // We keep a small retry loop just in case it drops temporarily or takes a second to be fully ready for commands
+    let max_retries = 3;
     let mut last_err = String::new();
     for attempt in 1..=max_retries {
         match run_wake_pause(&spotify, &device_id, target_volume).await {
@@ -170,8 +202,8 @@ async fn run_app() -> Result<(), String> {
                 let err_str = e.to_string();
                 let is_404 = err_str.contains("404");
                 if is_404 && attempt < max_retries {
-                    println!("Attempt {}/{}: Device not found (404), retrying in 500ms...", attempt, max_retries);
-                    sleep(Duration::from_millis(500)).await;
+                    println!("Attempt {}/{}: Device not found (404) during commands, retrying in 1s...", attempt, max_retries);
+                    sleep(Duration::from_millis(1000)).await;
                     last_err = err_str;
                     continue;
                 }
