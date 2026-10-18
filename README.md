@@ -1,3 +1,5 @@
+![Spotify Device Switcher](docs/cover.png)
+
 # Spotify Device Switcher
 
 A native Windows utility written in Rust to switch Spotify playback to a target device via the Spotify Web API.
